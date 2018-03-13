@@ -1,14 +1,11 @@
 from __future__ import division
 from __future__ import print_function
-
 from future import standard_library
 
 standard_library.install_aliases()
 from builtins import str
-from builtins import range
 from builtins import object
 from androguard.core import androconf
-from androguard.core.bytecodes.dvm_permissions import DVM_PERMISSIONS
 from androguard.util import read, get_certificate_name_string
 
 from androguard.core.bytecodes.axml import ARSCParser, AXMLPrinter, ARSCResTableConfig
@@ -16,14 +13,14 @@ from androguard.core.bytecodes.axml import ARSCParser, AXMLPrinter, ARSCResTable
 import io
 from zlib import crc32
 import re
-import sys
 import binascii
 import zipfile
 import logging
+from struct import unpack
+import hashlib
 
 import lxml.sax
 from xml.dom.pulldom import SAX2DOM
-from lxml import etree
 
 # Used for reading Certificates
 from pyasn1.codec.der.decoder import decode
@@ -57,8 +54,15 @@ class BrokenAPKError(Error):
     pass
 
 
-######################################################## APK FORMAT ########################################################
 class APK(object):
+    # Constants in ZipFile
+    _PK_END_OF_CENTRAL_DIR = b"\x50\x4b\x05\x06"
+    _PK_CENTRAL_DIR = b"\x50\x4b\x01\x02"
+
+    # Constants in the APK Signature Block
+    _APK_SIG_MAGIC = b"APK Sig Block 42"
+    _APK_SIG_KEY_SIGNATURE = 0x7109871a
+
     def __init__(self,
                  filename,
                  raw=False,
@@ -93,16 +97,22 @@ class APK(object):
         self.package = ""
         self.androidversion = {}
         self.permissions = []
+        self.uses_permissions = []
         self.declared_permissions = {}
         self.valid_apk = False
+        self._is_signed_v2 = None
+        self._v2_blocks = {}
 
-        self.files = {}
+        self._files = {}
         self.files_crc32 = {}
 
         self.magic_file = magic_file
 
         if raw is True:
             self.__raw = bytearray(filename)
+            self._sha256 = hashlib.sha256(self.__raw).hexdigest()
+            # Set the filename to something sane
+            self.filename = "raw_apk_sha256:{}".format(self._sha256)
         else:
             self.__raw = bytearray(read(filename))
 
@@ -157,7 +167,17 @@ class APK(object):
                         NS_ANDROID + "versionName")
 
                     for item in self.xml[i].findall('uses-permission'):
-                        self.permissions.append(item.get(NS_ANDROID + "name"))
+                        name = item.get(NS_ANDROID + "name")
+                        self.permissions.append(name)
+                        maxSdkVersion = None
+                        try:
+                            maxSdkVersion = int(item.get(NS_ANDROID + 'maxSdkVersion'))
+                        except ValueError:
+                            log.warning(item.get(NS_ANDROID + 'maxSdkVersion')
+                                        + 'is not a valid value for <uses-permission> maxSdkVersion')
+                        except TypeError:
+                            pass
+                        self.uses_permissions.append([name, maxSdkVersion])
 
                     # getting details of the declared permissions
                     for d_perm_item in self.xml[i].findall('permission'):
@@ -230,25 +250,30 @@ class APK(object):
 
     def is_valid_APK(self):
         """
-            Return true if the APK is valid, false otherwise
+        Return true if the APK is valid, false otherwise.
+        An APK is seen as valid, if the AndroidManifest.xml could be successful parsed.
+        This does not mean that the APK has a valid signature nor that the APK
+        can be installed on an Android system.
 
-            :rtype: boolean
+        :rtype: boolean
         """
         return self.valid_apk
 
     def get_filename(self):
         """
-            Return the filename of the APK
+        Return the filename of the APK
 
-            :rtype: string
+        :rtype: :class:`str`
         """
         return self.filename
 
     def get_app_name(self):
         """
-            Return the appname of the APK
+        Return the appname of the APK
 
-            :rtype: string
+        This name is read from the AndroidManifest.xml
+
+        :rtype: :class:`str`
         """
         main_activity_name = self.get_main_activity()
 
@@ -275,19 +300,22 @@ class APK(object):
 
     def get_app_icon(self, max_dpi=65536):
         """
-            Return the first non-greater density than max_dpi icon file name,
-            unless exact icon resolution is set in the manifest, in which case
-            return the exact file
+        Return the first icon file name, which density is not greater than max_dpi,
+        unless exact icon resolution is set in the manifest, in which case
+        return the exact file.
 
-            From https://developer.android.com/guide/practices/screens_support.html
-            ldpi (low) ~120dpi
-            mdpi (medium) ~160dpi
-            hdpi (high) ~240dpi
-            xhdpi (extra-high) ~320dpi
-            xxhdpi (extra-extra-high) ~480dpi
-            xxxhdpi (extra-extra-extra-high) ~640dpi
+        This information is read from the AndroidManifest.xml
 
-            :rtype: string
+        From https://developer.android.com/guide/practices/screens_support.html
+
+        * ldpi (low) ~120dpi
+        * mdpi (medium) ~160dpi
+        * hdpi (high) ~240dpi
+        * xhdpi (extra-high) ~320dpi
+        * xxhdpi (extra-extra-high) ~480dpi
+        * xxxhdpi (extra-extra-extra-high) ~640dpi
+
+        :rtype: :class:`str`
         """
         main_activity_name = self.get_main_activity()
 
@@ -331,33 +359,39 @@ class APK(object):
 
     def get_package(self):
         """
-            Return the name of the package
+        Return the name of the package
 
-            :rtype: string
+        This information is read from the AndroidManifest.xml
+
+        :rtype: :class:`str`
         """
         return self.package
 
     def get_androidversion_code(self):
         """
-            Return the android version code
+        Return the android version code
 
-            :rtype: string
+        This information is read from the AndroidManifest.xml
+
+        :rtype: :class:`str`
         """
         return self.androidversion["Code"]
 
     def get_androidversion_name(self):
         """
-            Return the android version name
+        Return the android version name
 
-            :rtype: string
+        This information is read from the AndroidManifest.xml
+
+        :rtype: :class:`str`
         """
         return self.androidversion["Name"]
 
     def get_files(self):
         """
-            Return the files inside the APK
+        Return the file names inside the APK.
 
-            :rtype: a list of strings
+        :rtype: a list of :class:`str`
         """
         return self.zip.namelist()
 
@@ -411,22 +445,40 @@ class APK(object):
         else:
             return self._patch_magic(buffer, ftype)
 
+    @property
+    def files(self):
+        """
+        Returns a dictionary of filenames and detected magic type
+
+        :return: dictionary of files and their mime type
+        """
+        return self.get_files_types()
+
     def get_files_types(self):
         """
-            Return the files inside the APK with their associated types (by using python-magic)
+        Return the files inside the APK with their associated types (by using python-magic)
 
-            :rtype: a dictionnary
+        :rtype: a dictionnary
         """
-        if self.files == {}:
+        if self._files == {}:
             # Generate File Types / CRC List
             for i in self.get_files():
                 buffer = self.zip.read(i)
                 self.files_crc32[i] = crc32(buffer)
-                self.files[i] = self._get_file_magic_name(buffer)
+                # FIXME why not use the crc from the zipfile?
+                #crc = self.zip.getinfo(i).CRC
+                self._files[i] = self._get_file_magic_name(buffer)
 
-        return self.files
+        return self._files
 
     def _patch_magic(self, buffer, orig):
+        """
+        Overwrite some probably wrong detections by mime libraries
+
+        :param buffer: bytes of the file to detect
+        :param orig: guess by mime libary
+        :return: corrected guess
+        """
         if ("Zip" in orig) or ("DBase" in orig):
             val = androconf.is_android_raw(buffer)
             if val == "APK":
@@ -451,27 +503,27 @@ class APK(object):
 
     def get_files_information(self):
         """
-            Return the files inside the APK with their associated types and crc32
+        Return the files inside the APK with their associated types and crc32
 
-            :rtype: string, string, int
+        :rtype: str, str, int
         """
         for k in self.get_files():
             yield k, self.get_files_types()[k], self.get_files_crc32()[k]
 
     def get_raw(self):
         """
-            Return raw bytes of the APK
+        Return raw bytes of the APK
 
-            :rtype: string
+        :rtype: bytes
         """
         return self.__raw
 
     def get_file(self, filename):
         """
-            Return the raw data of the specified filename
-            inside the APK
+        Return the raw data of the specified filename
+        inside the APK
 
-            :rtype: string
+        :rtype: bytes
         """
         try:
             return self.zip.read(filename)
@@ -480,9 +532,12 @@ class APK(object):
 
     def get_dex(self):
         """
-            Return the raw data of the classes dex file
+        Return the raw data of the classes dex file
 
-            :rtype: a string
+        This will give you the data of the file called `classes.dex`
+        inside the APK. If the APK has multiple DEX files, you need to use :func:`~APK.get_all_dex`.
+
+        :rtype: bytes
         """
         try:
             return self.get_file("classes.dex")
@@ -491,18 +546,20 @@ class APK(object):
 
     def get_dex_names(self):
         """
-            Return the name of all classes dex files
+        Return the names of all DEX files found in the APK.
+        This method only accounts for "offical" dex files, i.e. all files
+        in the root directory of the APK named classes.dex or classes[0-9]+.dex
 
-            :rtype: a list of string 
+        :rtype: a list of str
         """
         dexre = re.compile("classes(\d*).dex")
-        return filter(lambda x : dexre.match(x), self.get_files())
+        return filter(lambda x: dexre.match(x), self.get_files())
 
     def get_all_dex(self):
         """
-            Return the raw data of all classes dex files
+        Return the raw data of all classes dex files
 
-            :rtype: a generator
+        :rtype: a generator of bytes
         """
         for dex_name in self.get_dex_names():
             yield self.get_file(dex_name)
@@ -514,27 +571,32 @@ class APK(object):
         :return: True if multiple dex found, otherwise False
         """
         dexre = re.compile("^classes(\d+)?.dex$")
-        return len(
-            [instance for instance in self.get_files() if dexre.search(instance)]
-        ) > 1
+        return len([instance for instance in self.get_files() if dexre.search(instance)]) > 1
 
-    def get_elements(self, tag_name, attribute):
+    def get_elements(self, tag_name, attribute, with_namespace=True):
         """
-            Return elements in xml files which match with the tag name and the specific attribute
+        Return elements in xml files which match with the tag name and the specific attribute
 
-            :param tag_name: a string which specify the tag name
-            :param attribute: a string which specify the attribute
+        :param tag_name: a string which specify the tag name
+        :param attribute: a string which specify the attribute
         """
-        l = []
         for i in self.xml:
             for item in self.xml[i].findall('.//' + tag_name):
-                value = item.get(NS_ANDROID + attribute)
-                value = self.format_value(value)
+                if with_namespace:
+                    value = item.get(NS_ANDROID + attribute)
+                else:
+                    value = item.get(attribute)
+                # There might be an attribute without the namespace
+                if value:
+                    yield self._format_value(value)
 
-                l.append(value)
-        return l
+    def _format_value(self, value):
+        """
+        Format a value with packagename, if not already set
 
-    def format_value(self, value):
+        :param value:
+        :return:
+        """
         if len(value) > 0:
             if value[0] == ".":
                 value = self.package + value
@@ -548,14 +610,14 @@ class APK(object):
 
     def get_element(self, tag_name, attribute, **attribute_filter):
         """
-            Return element in xml files which match with the tag name and the specific attribute
+        Return element in xml files which match with the tag name and the specific attribute
 
-            :param tag_name: specify the tag name
-            :type tag_name: string
-            :param attribute: specify the attribute
-            :type attribute: string
+        :param tag_name: specify the tag name
+        :type tag_name: string
+        :param attribute: specify the attribute
+        :type attribute: string
 
-            :rtype: string
+        :rtype: string
         """
         for i in self.xml:
             if self.xml[i] is None:
@@ -582,9 +644,11 @@ class APK(object):
 
     def get_main_activity(self):
         """
-            Return the name of the main activity
+        Return the name of the main activity
 
-            :rtype: string
+        This value is read from the AndroidManifest.xml
+
+        :rtype: str
         """
         x = set()
         y = set()
@@ -612,60 +676,66 @@ class APK(object):
 
         z = x.intersection(y)
         if len(z) > 0:
-            return self.format_value(z.pop())
+            return self._format_value(z.pop())
         return None
 
     def get_activities(self):
         """
-            Return the android:name attribute of all activities
+        Return the android:name attribute of all activities
 
-            :rtype: a list of string
+        :rtype: a list of str
         """
-        return self.get_elements("activity", "name")
+        return list(self.get_elements("activity", "name"))
 
     def get_services(self):
         """
-            Return the android:name attribute of all services
+        Return the android:name attribute of all services
 
-            :rtype: a list of string
+        :rtype: a list of str
         """
-        return self.get_elements("service", "name")
+        return list(self.get_elements("service", "name"))
 
     def get_receivers(self):
         """
-            Return the android:name attribute of all receivers
+        Return the android:name attribute of all receivers
 
-            :rtype: a list of string
+        :rtype: a list of string
         """
-        return self.get_elements("receiver", "name")
+        return list(self.get_elements("receiver", "name"))
 
     def get_providers(self):
         """
-            Return the android:name attribute of all providers
+        Return the android:name attribute of all providers
 
-            :rtype: a list of string
+        :rtype: a list of string
         """
-        return self.get_elements("provider", "name")
+        return list(self.get_elements("provider", "name"))
 
-    def get_intent_filters(self, category, name):
+    def get_intent_filters(self, itemtype, name):
+        """
+        Find intent filters for a given item and name.
+
+        Intent filter are attached to activities, services or receivers.
+        You can search for the intent filters of such items and get a dictionary of all
+        attached actions and intent categories.
+
+        :param itemtype: the type of parent item to look for, e.g. `activity`,  `service` or `receiver`
+        :param name: the `android:name` of the parent item, e.g. activity name
+        :return: a dictionary with the keys `action` and `category` containing the `android:name` of those items
+        """
         d = {"action": [], "category": []}
 
         for i in self.xml:
-            for item in self.xml[i].findall(".//" + category):
-                if self.format_value(
-                        item.get(NS_ANDROID + "name")
-                ) == name:
+            # TODO: this can probably be solved using a single xpath
+            for item in self.xml[i].findall(".//" + itemtype):
+                if self._format_value(item.get(NS_ANDROID + "name")) == name:
                     for sitem in item.findall(".//intent-filter"):
                         for ssitem in sitem.findall("action"):
-                            if ssitem.get(NS_ANDROID + "name") \
-                                    not in d["action"]:
-                                d["action"].append(ssitem.get(
-                                    NS_ANDROID + "name"))
+                            if ssitem.get(NS_ANDROID + "name") not in d["action"]:
+                                d["action"].append(ssitem.get(NS_ANDROID + "name"))
                         for ssitem in sitem.findall("category"):
-                            if ssitem.get(NS_ANDROID + "name") \
-                                    not in d["category"]:
-                                d["category"].append(ssitem.get(
-                                    NS_ANDROID + "name"))
+                            if ssitem.get(NS_ANDROID + "name") not in d["category"]:
+                                d["category"].append(ssitem.get(NS_ANDROID + "name"))
 
         if not d["action"]:
             del d["action"]
@@ -677,49 +747,93 @@ class APK(object):
 
     def get_permissions(self):
         """
-            Return permissions
+        Return permissions
+
+        :rtype: list of str
+        """
+        return self.permissions
+
+    def get_uses_implied_permission_list(self):
+        """
+            Return all permissions implied by the target SDK or other permissions.
 
             :rtype: list of string
         """
-        return self.permissions
+        target_sdk_version = self.get_effective_target_sdk_version()
+
+        READ_CALL_LOG = 'android.permission.READ_CALL_LOG'
+        READ_CONTACTS = 'android.permission.READ_CONTACTS'
+        READ_EXTERNAL_STORAGE = 'android.permission.READ_EXTERNAL_STORAGE'
+        READ_PHONE_STATE = 'android.permission.READ_PHONE_STATE'
+        WRITE_CALL_LOG = 'android.permission.WRITE_CALL_LOG'
+        WRITE_CONTACTS = 'android.permission.WRITE_CONTACTS'
+        WRITE_EXTERNAL_STORAGE = 'android.permission.WRITE_EXTERNAL_STORAGE'
+
+        implied = []
+
+        implied_WRITE_EXTERNAL_STORAGE = False
+        if target_sdk_version < 4:
+            if WRITE_EXTERNAL_STORAGE not in self.permissions:
+                implied.append([WRITE_EXTERNAL_STORAGE, None])
+                implied_WRITE_EXTERNAL_STORAGE = True
+            if READ_PHONE_STATE not in self.permissions:
+                implied.append([READ_PHONE_STATE, None])
+
+        if (WRITE_EXTERNAL_STORAGE in self.permissions or implied_WRITE_EXTERNAL_STORAGE) \
+           and READ_EXTERNAL_STORAGE not in self.permissions:
+            maxSdkVersion = None
+            for name, version in self.uses_permissions:
+                if name == WRITE_EXTERNAL_STORAGE:
+                    maxSdkVersion = version
+                    break
+            implied.append([READ_EXTERNAL_STORAGE, maxSdkVersion])
+
+        if target_sdk_version < 16:
+            if READ_CONTACTS in self.permissions \
+               and READ_CALL_LOG not in self.permissions:
+                implied.append([READ_CALL_LOG, None])
+            if WRITE_CONTACTS in self.permissions \
+               and WRITE_CALL_LOG not in self.permissions:
+                implied.append([WRITE_CALL_LOG, None])
+
+        return implied
 
     def get_details_permissions(self):
         """
             Return permissions with details
 
-            :rtype: list of string
+            :rtype: dict of {permission: [protectionLevel, label, description]}
         """
         l = {}
 
         for i in self.permissions:
-            perm = i
-            pos = i.rfind(".")
-
-            if pos != -1:
-                perm = i[pos + 1:]
-
-            try:
-                l[i] = DVM_PERMISSIONS["MANIFEST_PERMISSION"][perm]
-            except KeyError:
+            if i in self.permission_module:
+                x = self.permission_module[i]
+                l[i] = [x["protectionLevel"], x["label"], x["description"]]
+            else:
+                # FIXME: the permission might be signature, if it is defined by the app itself!
                 l[i] = ["normal", "Unknown permission from android reference",
                         "Unknown permission from android reference"]
-
         return l
 
     @DeprecationWarning
     def get_requested_permissions(self):
         """
-            Returns all requested permissions.
+        Returns all requested permissions.
 
-            :rtype: list of strings
+        It has the same result as :func:`~APK.get_permissions` and might be removed in the future
+
+        :rtype: list of str
         """
         return self.get_permissions()
 
     def get_requested_aosp_permissions(self):
         """
-            Returns requested permissions declared within AOSP project.
+        Returns requested permissions declared within AOSP project.
 
-            :rtype: list of strings
+        This includes several other permissions as well, which are in the platform apps.
+
+        :rtype: list of str
         """
         aosp_permissions = []
         all_permissions = self.get_permissions()
@@ -730,9 +844,9 @@ class APK(object):
 
     def get_requested_aosp_permissions_details(self):
         """
-            Returns requested aosp permissions with details.
+        Returns requested aosp permissions with details.
 
-            :rtype: dictionary
+        :rtype: dictionary
         """
         l = {}
         for i in self.permissions:
@@ -745,9 +859,9 @@ class APK(object):
 
     def get_requested_third_party_permissions(self):
         """
-            Returns list of requested permissions not declared within AOSP project.
+        Returns list of requested permissions not declared within AOSP project.
 
-            :rtype: list of strings
+        :rtype: list of strings
         """
         third_party_permissions = []
         all_permissions = self.get_permissions()
@@ -758,17 +872,17 @@ class APK(object):
 
     def get_declared_permissions(self):
         """
-            Returns list of the declared permissions.
+        Returns list of the declared permissions.
 
-            :rtype: list of strings
+        :rtype: list of strings
         """
         return list(self.declared_permissions.keys())
 
     def get_declared_permissions_details(self):
         """
-            Returns declared permissions with the details.
+        Returns declared permissions with the details.
 
-            :rtype: dict
+        :rtype: dict
         """
         return self.declared_permissions
 
@@ -795,6 +909,24 @@ class APK(object):
             :rtype: string
         """
         return self.get_element("uses-sdk", "targetSdkVersion")
+
+    def get_effective_target_sdk_version(self):
+        """
+            Return the effective targetSdkVersion, always returns int > 0.
+
+            If the targetSdkVersion is not set, it defaults to 1.  This is
+            set based on defaults as defined in:
+            https://developer.android.com/guide/topics/manifest/uses-sdk-element.html
+
+            :rtype: int
+        """
+        target_sdk_version = self.get_target_sdk_version()
+        if not target_sdk_version:
+            target_sdk_version = self.get_min_sdk_version()
+        try:
+            return int(target_sdk_version)
+        except (ValueError, TypeError):
+            return 1
 
     def get_libraries(self):
         """
@@ -839,7 +971,7 @@ class APK(object):
         Return a X.509 certificate object by giving the name in the apk file
 
         :param filename: filename of the signature file in the APK
-        :return: a `x509` certificate
+        :return: a :class:`Certificate` certificate
         """
         cert = self.get_certificate_der(filename)
         certificate = x509.load_der_x509_certificate(cert, default_backend())
@@ -891,7 +1023,7 @@ class APK(object):
         """
             Return the :class:`AXMLPrinter` object which corresponds to the AndroidManifest.xml file
 
-            :rtype: :class:`AXMLPrinter`
+            :rtype: :class:`~androguard.core.bytecodes.axml.AXMLPrinter`
         """
         try:
             return self.axml["AndroidManifest.xml"]
@@ -900,9 +1032,9 @@ class APK(object):
 
     def get_android_manifest_xml(self):
         """
-            Return the xml object which corresponds to the AndroidManifest.xml file
+        Return the parsed xml object which corresponds to the AndroidManifest.xml file
 
-            :rtype: object
+        :rtype: :class:`~lxml.etree.Element`
         """
         try:
             return self.xml["AndroidManifest.xml"]
@@ -911,9 +1043,9 @@ class APK(object):
 
     def get_android_resources(self):
         """
-            Return the :class:`ARSCParser` object which corresponds to the resources.arsc file
+        Return the :class:`~androguard.core.bytecodes.axml.ARSCParser` object which corresponds to the resources.arsc file
 
-            :rtype: :class:`ARSCParser`
+        :rtype: :class:`~androguard.core.bytecodes.axml.ARSCParser`
         """
         try:
             return self.arsc["resources.arsc"]
@@ -924,6 +1056,147 @@ class APK(object):
                 return None
             self.arsc["resources.arsc"] = ARSCParser(self.zip.read("resources.arsc"))
             return self.arsc["resources.arsc"]
+
+    def is_signed(self):
+        """
+        Returns true if either a v1 or v2 (or both) signature was found.
+        """
+        return self.is_signed_v1() or self.is_signed_v2()
+
+    def is_signed_v1(self):
+        """
+        Returns true if a v1 / JAR signature was found.
+
+        Returning `True` does not mean that the file is properly signed!
+        It just says that there is a signature file which needs to be validated.
+        """
+        return self.get_signature_name() is not None
+
+    def is_signed_v2(self):
+        """
+        Returns true of a v2 / APK signature was found.
+
+        Returning `True` does not mean that the file is properly signed!
+        It just says that there is a signature file which needs to be validated.
+        """
+        if not self._is_signed_v2:
+            # Need to find an v2 Block in the APK.
+            # The Google Docs gives you the following rule:
+            # * go to the end of the ZIP File
+            # * search for the End of Central directory
+            # * then jump to the beginning of the central directory
+            # * Read now the magic of the signing block
+            # * before the magic there is the size_of_block, so we can jump to
+            # the beginning.
+            # * There should be again the size_of_block
+            # * Now we can read the Key-Values
+            # * IDs with an unknown value should be ignored.
+            f = io.BytesIO(self.__raw)
+
+            size_central = None
+            offset_central = None
+
+            # Go to the end
+            f.seek(-1, io.SEEK_END)
+            # we know the minimal length for the central dir is 16+4+2
+            f.seek(-20, io.SEEK_CUR)
+            while f.tell() > 0:
+                f.seek(-1, io.SEEK_CUR)
+                r, = unpack('<4s', f.read(4))
+                if r == self._PK_END_OF_CENTRAL_DIR:
+                    # Read central dir
+                    this_disk, disk_central, this_entries, total_entries, \
+                    size_central, offset_central = unpack('<HHHHII', f.read(16))
+                    # TODO according to the standard we need to check if the
+                    # end of central directory is the last item in the zip file
+                    # TODO We also need to check if the central dir is exactly
+                    # before the end of central dir...
+
+                    # These things should not happen for APKs
+                    assert this_disk == 0, "Not sure what to do with multi disk ZIP!"
+                    assert disk_central == 0, "Not sure what to do with multi disk ZIP!"
+                    break
+                f.seek(-4, io.SEEK_CUR)
+            if offset_central:
+                f.seek(offset_central)
+                r, = unpack('<4s', f.read(4))
+                f.seek(-4, io.SEEK_CUR)
+                assert r == self._PK_CENTRAL_DIR, "No Central Dir at specified offset"
+
+                # Go back and check if we have a magic
+                end_offset = f.tell()
+                f.seek(-24, io.SEEK_CUR)
+                size_of_block, magic = unpack('<Q16s', f.read(24))
+                self._is_signed_v2 = False
+                if magic == self._APK_SIG_MAGIC:
+                    # go back size_of_blocks + 8 and read size_of_block again
+                    f.seek(-(size_of_block + 8), io.SEEK_CUR)
+                    size_of_block_start, = unpack("<Q", f.read(8))
+                    assert size_of_block_start == size_of_block, "Sizes at beginning and and does not match!"
+
+                    # Store all blocks
+                    while f.tell() < end_offset - 24:
+                        size, key = unpack('<QI', f.read(12))
+                        value = f.read(size - 4)
+                        self._v2_blocks[key] = value
+
+                    # Test if a signature is found
+                    if self._APK_SIG_KEY_SIGNATURE in self._v2_blocks:
+                        self._is_signed_v2 = True
+
+        return self._is_signed_v2
+
+    def get_certificates_der_v2(self):
+        """
+        Return a list of DER coded X.509 certificates from the v2 signature
+        """
+        # calling is_signed_v2 should also load the signature, if any
+        if not self.is_signed_v2():
+            return []
+
+        certificates = []
+        block_bytes = self._v2_blocks[self._APK_SIG_KEY_SIGNATURE]
+        block = io.BytesIO(block_bytes)
+
+        size_sequence, = unpack('<I', block.read(4))
+        assert size_sequence + 4 == len(block_bytes), "size of sequence and blocksize does not match"
+        while block.tell() < len(block_bytes):
+            size_signer, = unpack('<I', block.read(4))
+
+            len_signed_data, = unpack('<I', block.read(4))
+            len_digests, = unpack('<I', block.read(4))
+            # Skip it for now
+            block.seek(len_digests, io.SEEK_CUR)
+
+            len_certs, = unpack('<I', block.read(4))
+            start_certs = block.tell()
+            while block.tell() < start_certs + len_certs:
+                len_cert, = unpack('<I', block.read(4))
+                certificates.append(block.read(len_cert))
+
+            # Now we have the signatures and the public key...
+            # we need to read it (or at least skip it)
+            len_attr, = unpack('<I', block.read(4))
+            block.seek(len_attr, io.SEEK_CUR)
+            len_sigs, = unpack('<I', block.read(4))
+            block.seek(len_sigs, io.SEEK_CUR)
+            len_publickey, = unpack('<I', block.read(4))
+            block.seek(len_publickey, io.SEEK_CUR)
+
+        return certificates
+
+    def get_certificates_v2(self):
+        """
+        Return a list of :class:`cryptography.x509.Certificate` which are found
+        in the v2 signing block.
+        Note that we simply extract all certificates regardless of the signer.
+        Therefore this is just a list of all certificates found in all signers.
+        """
+        certs = []
+        for cert in self.get_certificates_der_v2():
+            certs.append(x509.load_der_x509_certificate(cert, default_backend()))
+
+        return certs
 
     def get_signature_name(self):
         """
@@ -937,7 +1210,10 @@ class APK(object):
 
     def get_signature_names(self):
         """
-             Return a list of the signature file names.
+        Return a list of the signature file names (v1 Signature / JAR
+        Signature)
+
+        :rtype: List of filenames matching a Signature
         """
         signature_expr = re.compile("^(META-INF/)(.*)(\.RSA|\.EC|\.DSA)$")
         signatures = []
@@ -950,7 +1226,10 @@ class APK(object):
 
     def get_signature(self):
         """
-            Return the data of the first signature file found.
+        Return the data of the first signature file found (v1 Signature / JAR
+        Signature)
+
+        :rtype: First signature name or None if not signed
         """
         if self.get_signatures():
             return self.get_signatures()[0]
@@ -959,7 +1238,10 @@ class APK(object):
 
     def get_signatures(self):
         """
-            Return a list of the data of the signature files.
+        Return a list of the data of the signature files.
+        Only v1 / JAR Signing.
+
+        :rtype: list of bytes
         """
         signature_expr = re.compile("^(META-INF/)(.*)(\.RSA|\.EC|\.DSA)$")
         signature_datas = []
@@ -976,7 +1258,7 @@ class APK(object):
         print("FILES: ")
         for i in self.get_files():
             try:
-                print("\t", i, self.files[i], "%x" % self.files_crc32[i])
+                print("\t", i, self._files[i], "%x" % self.files_crc32[i])
             except KeyError:
                 print("\t", i, "%x" % self.files_crc32[i])
 
@@ -1012,10 +1294,15 @@ class APK(object):
 
         print("PROVIDERS: ", self.get_providers())
 
-        print("CERTIFICATES:")
-        for c in self.get_signature_names():
-            show_Certificate(self.get_certificate(c))
+        if self.is_signed_v1():
+            print("CERTIFICATES v1:")
+            for c in self.get_signature_names():
+                show_Certificate(self.get_certificate(c))
 
+        if self.is_signed_v2():
+            print("CERTIFICATES v2:")
+            for c in self.get_certificates_v2():
+                show_Certificate(c)
 
 
 
@@ -1034,3 +1321,4 @@ def show_Certificate(cert, short=False):
         print("{}: {}".format(h.name, binascii.hexlify(cert.fingerprint(h())).decode("ascii")))
     print("Issuer: {}".format(get_certificate_name_string(cert.issuer, short=short)))
     print("Subject: {}".format(get_certificate_name_string(cert.subject, short=short)))
+
